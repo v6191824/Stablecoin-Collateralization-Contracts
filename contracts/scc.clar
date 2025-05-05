@@ -10,9 +10,10 @@
 (define-constant err-unauthorized (err u108))
 (define-constant err-invalid-amount (err u109))
 
-(define-constant minimum-collateral-ratio u150)
-(define-constant liquidation-ratio u130)
-(define-constant liquidation-penalty u10)
+(define-data-var minimum-collateral-ratio-var uint u150)
+(define-data-var liquidation-ratio-var uint u130)
+(define-data-var liquidation-penalty uint u10)
+(define-data-var stability-fee-var uint u10)
 (define-constant minimum-collateral-amount u100000000)
 (define-constant stablecoin-precision u1000000)
 
@@ -96,7 +97,7 @@
   )
     (asserts! (>= amount u0) err-invalid-amount)
     (asserts! (<= amount current-collateral) err-not-enough-collateral)
-    (asserts! (or (is-eq current-debt u0) (>= (collateral-ratio new-collateral current-debt) minimum-collateral-ratio)) err-below-minimum-collateral)
+    (asserts! (or (is-eq current-debt u0) (>= (collateral-ratio new-collateral current-debt) (var-get minimum-collateral-ratio-var))) err-below-minimum-collateral)
     (try! (as-contract (stx-transfer? amount tx-sender sender)))
     (ok (map-set vaults
       {owner: sender}
@@ -120,7 +121,7 @@
     (new-balance (+ (get balance user-balance) amount))
   )
     (asserts! (>= amount u0) err-invalid-amount)
-    (asserts! (>= (collateral-ratio current-collateral new-debt) minimum-collateral-ratio) err-below-minimum-collateral)
+    (asserts! (>= (collateral-ratio current-collateral new-debt) (var-get minimum-collateral-ratio-var)) err-below-minimum-collateral)
     (map-set vaults
       {owner: sender}
       {
@@ -176,7 +177,7 @@
     (debt-amount (get debt vault))
     (ratio (collateral-ratio collateral-amount debt-amount))
   )
-    (asserts! (< ratio liquidation-ratio) err-liquidation-failed)
+    (asserts! (< ratio (var-get liquidation-ratio-var)) err-liquidation-failed)
     (try! (ft-burn? stablecoin debt-amount tx-sender))
     (try! (as-contract (stx-transfer? collateral-amount tx-sender tx-sender)))
     (map-delete vaults {owner: vault-owner})
@@ -234,4 +235,68 @@
     (try! (ft-transfer? stablecoin amount sender recipient))
     (ok true)
   )
+)
+
+
+(define-constant timelock-period u144) ;; 24 hours in blocks
+(define-constant err-pending-change (err u110))
+(define-constant err-no-pending-change (err u111))
+(define-constant err-timelock-active (err u112))
+
+(define-map parameter-changes
+    { parameter: (string-ascii 24) }
+    {
+        new-value: uint,
+        activation-height: uint
+    }
+)
+
+(define-public (queue-parameter-change (parameter (string-ascii 24)) (new-value uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-none (map-get? parameter-changes {parameter: parameter})) err-pending-change)
+        (ok (map-set parameter-changes
+            {parameter: parameter}
+            {
+                new-value: new-value,
+                activation-height: (+ stacks-block-height timelock-period)
+            }
+        ))
+    )
+)
+
+
+(define-constant err-flash-loan-failed (err u113))
+
+(define-public (flash-loan (amount uint) (recipient principal))
+    (let (
+        (current-supply (var-get total-supply))
+        (fee (/ (* amount u1) u1000))
+    )
+        (asserts! (> amount u0) err-invalid-amount)
+        (try! (ft-mint? stablecoin amount recipient))
+        (let ((repay-amount (+ amount fee)))
+            (asserts! (>= (ft-get-balance stablecoin recipient) repay-amount) err-flash-loan-failed)
+            (try! (ft-burn? stablecoin repay-amount recipient))
+            (var-set total-supply (+ current-supply fee))
+            (ok true)
+        )
+    )
+)
+
+(define-public (execute-parameter-change (parameter (string-ascii 24)))
+    (let (
+        (pending-change (unwrap! (map-get? parameter-changes {parameter: parameter}) err-no-pending-change))
+        (activation-height (get activation-height pending-change))
+    )
+        (asserts! (< stacks-block-height activation-height) err-timelock-active)
+        (map-set parameter-changes
+            {parameter: parameter}
+            {
+                new-value: (get new-value pending-change),
+                activation-height: u0
+            }
+        )
+        (ok true)
+    )
 )
