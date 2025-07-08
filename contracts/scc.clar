@@ -27,6 +27,84 @@
 (define-constant err-collateral-exists (err u201))
 (define-constant err-invalid-collateral-ratio (err u202))
 
+(define-constant err-invalid-stake (err u300))
+(define-constant err-no-stake (err u301))
+(define-constant err-insufficient-rewards (err u302))
+(define-constant err-cooldown-active (err u303))
+(define-constant err-invalid-pool (err u304))
+
+(define-constant stake-cooldown-period u1440)
+(define-constant max-apy-rate u2000)
+(define-constant base-apy-rate u500)
+(define-constant loyalty-bonus-threshold u4320)
+(define-constant governance-token-rate u100)
+
+(define-fungible-token governance-token)
+
+(define-data-var total-staked uint u0)
+(define-data-var total-rewards-distributed uint u0)
+(define-data-var reward-pool-balance uint u0)
+(define-data-var current-epoch uint u1)
+(define-data-var epoch-start-height uint u0)
+(define-data-var epoch-duration uint u1440)
+
+(define-map staking-pools
+  { pool-id: uint }
+  {
+    name: (string-ascii 32),
+    token-type: uint,
+    total-staked: uint,
+    reward-rate: uint,
+    active: bool,
+    min-stake: uint,
+    max-stake: uint,
+    created-at: uint
+  }
+)
+
+(define-map user-stakes
+  { user: principal, pool-id: uint }
+  {
+    amount: uint,
+    entry-block: uint,
+    last-claim: uint,
+    accumulated-rewards: uint,
+    multiplier: uint,
+    loyalty-tier: uint
+  }
+)
+
+(define-map user-staking-history
+  { user: principal }
+  {
+    total-staked: uint,
+    total-claimed: uint,
+    stake-count: uint,
+    first-stake-block: uint,
+    governance-tokens: uint
+  }
+)
+
+(define-map loyalty-tiers
+  { tier: uint }
+  {
+    min-duration: uint,
+    multiplier: uint,
+    name: (string-ascii 16)
+  }
+)
+
+(define-map epoch-rewards
+  { epoch: uint, pool-id: uint }
+  {
+    total-distributed: uint,
+    participants: uint,
+    avg-stake: uint
+  }
+)
+
+(define-data-var next-pool-id uint u1)
+
 (define-map supported-collaterals
   { asset-id: uint }
   {
@@ -511,4 +589,258 @@
   )
     (+ total-value (* (get collateral vault) (get price price-info)))
   )
+)
+
+
+(define-public (initialize-loyalty-tiers)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set loyalty-tiers { tier: u1 } { min-duration: u0, multiplier: u100, name: "Bronze" })
+    (map-set loyalty-tiers { tier: u2 } { min-duration: u1440, multiplier: u125, name: "Silver" })
+    (map-set loyalty-tiers { tier: u3 } { min-duration: u4320, multiplier: u150, name: "Gold" })
+    (map-set loyalty-tiers { tier: u4 } { min-duration: u10080, multiplier: u200, name: "Platinum" })
+    (var-set epoch-start-height stacks-block-height)
+    (ok true)
+  )
+)
+
+(define-public (create-staking-pool
+  (name (string-ascii 32))
+  (token-type uint)
+  (reward-rate uint)
+  (min-stake uint)
+  (max-stake uint))
+  (let ((pool-id (var-get next-pool-id)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (>= reward-rate u1) err-invalid-amount)
+    (asserts! (<= reward-rate max-apy-rate) err-invalid-amount)
+    (asserts! (< min-stake max-stake) err-invalid-amount)
+    (map-set staking-pools
+      { pool-id: pool-id }
+      {
+        name: name,
+        token-type: token-type,
+        total-staked: u0,
+        reward-rate: reward-rate,
+        active: true,
+        min-stake: min-stake,
+        max-stake: max-stake,
+        created-at: stacks-block-height
+      }
+    )
+    (var-set next-pool-id (+ pool-id u1))
+    (ok pool-id)
+  )
+)
+
+(define-public (stake-tokens (pool-id uint) (amount uint))
+  (let (
+    (pool (unwrap! (map-get? staking-pools { pool-id: pool-id }) err-invalid-pool))
+    (existing-stake (default-to
+      { amount: u0, entry-block: u0, last-claim: u0, accumulated-rewards: u0, multiplier: u100, loyalty-tier: u1 }
+      (map-get? user-stakes { user: tx-sender, pool-id: pool-id })))
+    (new-amount (+ (get amount existing-stake) amount))
+    (user-history (default-to
+      { total-staked: u0, total-claimed: u0, stake-count: u0, first-stake-block: u0, governance-tokens: u0 }
+      (map-get? user-staking-history { user: tx-sender })))
+    (loyalty-tier (calculate-loyalty-tier tx-sender))
+    (tier-info (unwrap! (map-get? loyalty-tiers { tier: loyalty-tier }) err-invalid-amount))
+  )
+    (asserts! (get active pool) err-invalid-pool)
+    (asserts! (>= amount (get min-stake pool)) err-invalid-stake)
+    (asserts! (<= new-amount (get max-stake pool)) err-invalid-stake)
+    (asserts! (>= amount u1) err-invalid-amount)
+    
+    (try! (if (is-eq (get token-type pool) u0)
+      (ft-transfer? stablecoin amount tx-sender (as-contract tx-sender))
+      (ok true)
+    ))
+    
+    (map-set user-stakes
+      { user: tx-sender, pool-id: pool-id }
+      {
+        amount: new-amount,
+        entry-block: (if (is-eq (get amount existing-stake) u0) stacks-block-height (get entry-block existing-stake)),
+        last-claim: stacks-block-height,
+        accumulated-rewards: (get accumulated-rewards existing-stake),
+        multiplier: (get multiplier tier-info),
+        loyalty-tier: loyalty-tier
+      }
+    )
+    
+    (map-set user-staking-history
+      { user: tx-sender }
+      {
+        total-staked: (+ (get total-staked user-history) amount),
+        total-claimed: (get total-claimed user-history),
+        stake-count: (+ (get stake-count user-history) u1),
+        first-stake-block: (if (is-eq (get first-stake-block user-history) u0) stacks-block-height (get first-stake-block user-history)),
+        governance-tokens: (get governance-tokens user-history)
+      }
+    )
+    
+    (map-set staking-pools
+      { pool-id: pool-id }
+      (merge pool { total-staked: (+ (get total-staked pool) amount) })
+    )
+    
+    (var-set total-staked (+ (var-get total-staked) amount))
+    (ok true)
+  )
+)
+
+(define-public (unstake-tokens (pool-id uint) (amount uint))
+  (let (
+    (pool (unwrap! (map-get? staking-pools { pool-id: pool-id }) err-invalid-pool))
+    (stake (unwrap! (map-get? user-stakes { user: tx-sender, pool-id: pool-id }) err-no-stake))
+    (cooldown-passed (>= (- stacks-block-height (get entry-block stake)) stake-cooldown-period))
+    (new-amount (- (get amount stake) amount))
+  )
+    (asserts! (get active pool) err-invalid-pool)
+    (asserts! (<= amount (get amount stake)) err-invalid-stake)
+    (asserts! cooldown-passed err-cooldown-active)
+    (asserts! (> amount u0) err-invalid-amount)
+    
+    (try! (claim-rewards pool-id))
+    
+    (if (is-eq new-amount u0)
+      (map-delete user-stakes { user: tx-sender, pool-id: pool-id })
+      (map-set user-stakes
+        { user: tx-sender, pool-id: pool-id }
+        (merge stake { amount: new-amount })
+      )
+    )
+    
+    (map-set staking-pools
+      { pool-id: pool-id }
+      (merge pool { total-staked: (- (get total-staked pool) amount) })
+    )
+    
+    (var-set total-staked (- (var-get total-staked) amount))
+    
+    (if (is-eq (get token-type pool) u0)
+      (as-contract (ft-transfer? stablecoin amount tx-sender tx-sender))
+      (ok true)
+    )
+  )
+)
+
+(define-public (claim-rewards (pool-id uint))
+  (let (
+    (pool (unwrap! (map-get? staking-pools { pool-id: pool-id }) err-invalid-pool))
+    (stake (unwrap! (map-get? user-stakes { user: tx-sender, pool-id: pool-id }) err-no-stake))
+    (blocks-elapsed (- stacks-block-height (get last-claim stake)))
+    (base-reward (/ (* (* (get amount stake) (get reward-rate pool)) blocks-elapsed) (* u365 u1440 u10000)))
+    (multiplied-reward (/ (* base-reward (get multiplier stake)) u100))
+    (governance-reward (/ (* multiplied-reward governance-token-rate) u10000))
+    (user-history (default-to
+      { total-staked: u0, total-claimed: u0, stake-count: u0, first-stake-block: u0, governance-tokens: u0 }
+      (map-get? user-staking-history { user: tx-sender })))
+  )
+    (asserts! (get active pool) err-invalid-pool)
+    (asserts! (> multiplied-reward u0) err-insufficient-rewards)
+    
+    (try! (ft-mint? stablecoin multiplied-reward tx-sender))
+    (try! (ft-mint? governance-token governance-reward tx-sender))
+    
+    (map-set user-stakes
+      { user: tx-sender, pool-id: pool-id }
+      (merge stake {
+        last-claim: stacks-block-height,
+        accumulated-rewards: (+ (get accumulated-rewards stake) multiplied-reward)
+      })
+    )
+    
+    (map-set user-staking-history
+      { user: tx-sender }
+      (merge user-history {
+        total-claimed: (+ (get total-claimed user-history) multiplied-reward),
+        governance-tokens: (+ (get governance-tokens user-history) governance-reward)
+      })
+    )
+    
+    (var-set total-rewards-distributed (+ (var-get total-rewards-distributed) multiplied-reward))
+    (ok multiplied-reward)
+  )
+)
+
+(define-public (advance-epoch)
+  (let (
+    (current-epoch-val (var-get current-epoch))
+    (epoch-duration-val (var-get epoch-duration))
+    (epoch-start (var-get epoch-start-height))
+  )
+    (asserts! (>= (- stacks-block-height epoch-start) epoch-duration-val) err-invalid-amount)
+    (var-set current-epoch (+ current-epoch-val u1))
+    (var-set epoch-start-height stacks-block-height)
+    (ok (var-get current-epoch))
+  )
+)
+
+(define-public (update-pool-reward-rate (pool-id uint) (new-rate uint))
+  (let ((pool (unwrap! (map-get? staking-pools { pool-id: pool-id }) err-invalid-pool)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-rate max-apy-rate) err-invalid-amount)
+    (asserts! (>= new-rate u1) err-invalid-amount)
+    (ok (map-set staking-pools
+      { pool-id: pool-id }
+      (merge pool { reward-rate: new-rate })
+    ))
+  )
+)
+
+(define-read-only (calculate-loyalty-tier (user principal))
+  (let (
+    (user-history (default-to
+      { total-staked: u0, total-claimed: u0, stake-count: u0, first-stake-block: u0, governance-tokens: u0 }
+      (map-get? user-staking-history { user: user })))
+    (staking-duration (if (is-eq (get first-stake-block user-history) u0)
+                        u0
+                        (- stacks-block-height (get first-stake-block user-history))))
+  )
+    (if (>= staking-duration u10080) u4
+      (if (>= staking-duration u4320) u3
+        (if (>= staking-duration u1440) u2 u1)
+      )
+    )
+  )
+)
+
+(define-read-only (get-pending-rewards (user principal) (pool-id uint))
+  (let (
+    (pool (unwrap! (map-get? staking-pools { pool-id: pool-id }) (err u0)))
+    (stake (unwrap! (map-get? user-stakes { user: user, pool-id: pool-id }) (err u0)))
+    (blocks-elapsed (- stacks-block-height (get last-claim stake)))
+    (base-reward (/ (* (* (get amount stake) (get reward-rate pool)) blocks-elapsed) (* u365 u1440 u10000)))
+  )
+    (ok (/ (* base-reward (get multiplier stake)) u100))
+  )
+)
+
+(define-read-only (get-stake-info (user principal) (pool-id uint))
+  (map-get? user-stakes { user: user, pool-id: pool-id })
+)
+
+(define-read-only (get-pool-info (pool-id uint))
+  (map-get? staking-pools { pool-id: pool-id })
+)
+
+(define-read-only (get-user-history (user principal))
+  (map-get? user-staking-history { user: user })
+)
+
+(define-read-only (get-loyalty-tier-info (tier uint))
+  (map-get? loyalty-tiers { tier: tier })
+)
+
+(define-read-only (get-total-staked)
+  (var-get total-staked)
+)
+
+(define-read-only (get-total-rewards-distributed)
+  (var-get total-rewards-distributed)
+)
+
+(define-read-only (get-current-epoch)
+  (var-get current-epoch)
 )
